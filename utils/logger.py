@@ -290,17 +290,137 @@ def get_logger(name: Optional[str] = None, module_name: Optional[str] = None) ->
     return logging.getLogger(name)
 
 
-# Initialize global logger instance
-try:
-    logger = setup_global_logger()
-except Exception as e:
-    # Fallback to basic logger if setup fails
-    logger = logging.getLogger("utils-service")
-    logging.basicConfig(level=logging.INFO)
-    logger.warning(f"Failed to setup global logger: {e}")
+class Logger:
+    """Singleton logger instance.
+    
+    Provides a global logger accessible throughout the application with
+    config-driven setup and structured logging capabilities.
+    """
+    
+    _instance = None
+    _logger = None
+    
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern to ensure single logger instance."""
+        if cls._instance is None:
+            cls._instance = super(Logger, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self, service_name: Optional[str] = None, use_config: bool = True):
+        """Initialize singleton logger.
+        
+        Args:
+            service_name: Override service name (defaults to config value)
+            use_config: Try to load configuration from config utility
+        """
+        if self._logger is None:
+            self._logger = setup_global_logger(service_name=service_name, use_dict_config=use_config)
+    
+    def info(self, msg: str, *args, **kwargs):
+        """Log an info message."""
+        return self._logger.info(msg, *args, **kwargs)
+    
+    def debug(self, msg: str, *args, **kwargs):
+        """Log a debug message."""
+        return self._logger.debug(msg, *args, **kwargs)
+    
+    def warning(self, msg: str, *args, **kwargs):
+        """Log a warning message."""
+        return self._logger.warning(msg, *args, **kwargs)
+    
+    def error(self, msg: str, *args, **kwargs):
+        """Log an error message."""
+        return self._logger.error(msg, *args, **kwargs)
+    
+    def critical(self, msg: str, *args, **kwargs):
+        """Log a critical message."""
+        return self._logger.critical(msg, *args, **kwargs)
+    
+    def exception(self, msg: str, *args, **kwargs):
+        """Log an exception."""
+        return self._logger.exception(msg, *args, **kwargs)
+    
+    def get_underlying_logger(self) -> logging.Logger:
+        """Get the underlying Python logger instance."""
+        return self._logger
+    
+    @classmethod
+    def reset(cls):
+        """Reset singleton (for testing purposes)."""
+        cls._instance = None
+        cls._logger = None
+
+
+# Lazy initialization of global logger singleton
+_logger_instance = None
+
+
+def _get_or_create_logger():
+    """Lazy initialization of logger singleton.
+    
+    Returns the existing logger or creates one on first access.
+    This ensures config is loaded before logger is initialized.
+    """
+    global _logger_instance
+    if _logger_instance is None:
+        try:
+            _logger_instance = Logger()
+        except Exception as e:
+            # Fallback to basic logger if setup fails
+            fallback_logger = logging.getLogger("utils-service")
+            logging.basicConfig(level=logging.INFO)
+            fallback_logger.warning(f"Failed to setup global logger: {e}")
+            
+            # Create a minimal Logger singleton with fallback
+            class FallbackLogger:
+                def __init__(self):
+                    self._logger = fallback_logger
+                
+                def info(self, msg, *args, **kwargs):
+                    return self._logger.info(msg, *args, **kwargs)
+                
+                def debug(self, msg, *args, **kwargs):
+                    return self._logger.debug(msg, *args, **kwargs)
+                
+                def warning(self, msg, *args, **kwargs):
+                    return self._logger.warning(msg, *args, **kwargs)
+                
+                def error(self, msg, *args, **kwargs):
+                    return self._logger.error(msg, *args, **kwargs)
+                
+                def critical(self, msg, *args, **kwargs):
+                    return self._logger.critical(msg, *args, **kwargs)
+                
+                def exception(self, msg, *args, **kwargs):
+                    return self._logger.exception(msg, *args, **kwargs)
+                
+                def get_underlying_logger(self):
+                    return self._logger
+            
+            _logger_instance = FallbackLogger()
+    
+    return _logger_instance
+
+
+class _LoggerProxy:
+    """Proxy that lazily initializes logger on first use.
+    
+    This ensures config is loaded before logger initialization when using:
+        from utils import logger
+        logger.info("message")
+    """
+    
+    def __getattr__(self, name):
+        """Delegate all attribute access to the real logger."""
+        return getattr(_get_or_create_logger(), name)
+
+
+# Create a proxy instance that will lazily initialize the real logger
+logger = _LoggerProxy()
 
 
 __all__ = [
+    'Logger',
     'logger',
     'get_logger',
     'setup_logging',
