@@ -19,7 +19,7 @@ def run_pytest(repo_root: Path, reports_dir: Path) -> int:
         "-q",
         "tests",
         f"--junitxml={junit_path}",
-        "--cov=utils_api",
+        "--cov=utils",
         f"--cov-report=xml:{coverage_xml}",
         f"--cov-report=html:{coverage_html_dir}",
         "--cov-report=term-missing",

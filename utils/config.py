@@ -1,15 +1,279 @@
-"""Configuration loading helpers for API services."""
+"""Configuration loading helpers for API services.
+
+This module provides flexible configuration management with support for:
+- Multiple config file formats (JSON, YAML)
+- Environment variable resolution with ${VAR_NAME} syntax
+- Directory auto-creation
+- Singleton pattern for global config instances
+- Dot notation for nested config access
+- Pydantic BaseSettings integration
+"""
 
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic_settings import BaseSettings
 import yaml
+from dotenv import load_dotenv
+
+# Load .env file at module import time
+load_dotenv()
 
 SettingsType = TypeVar("SettingsType", bound=BaseSettings)
+
+
+class Config:
+    """Flexible configuration loader with singleton pattern and advanced features.
+    
+    Features:
+    - Singleton pattern for consistent config access
+    - Load multiple JSON/YAML files from config directory
+    - Environment variable resolution (${VAR_NAME} syntax)
+    - Auto-create directories defined in config
+    - Dot notation access (e.g., 'database.host')
+    - Type-safe path handling
+    """
+    
+    _instance = None
+    _config = None
+    
+    def __new__(cls):
+        """Singleton pattern to ensure single config instance."""
+        if cls._instance is None:
+            cls._instance = super(Config, cls).__new__(cls)
+        return cls._instance
+    
+    def __init__(self, config_dir: str | Path = "config", auto_create_dirs: bool = True):
+        """Initialize configuration loader.
+        
+        Args:
+            config_dir: Directory containing configuration files
+            auto_create_dirs: Auto-create directories from 'paths' config
+        """
+        if self._config is None:
+            self.config_dir = Path(config_dir)
+            self.auto_create_dirs = auto_create_dirs
+            self._load_config()
+            if self.auto_create_dirs:
+                self._create_directories()
+    
+    def _load_config(self):
+        """Load and merge all configuration files from config directory."""
+        if not self.config_dir.exists():
+            # Don't raise error, just initialize empty config
+            self._config = {}
+            return
+        
+        # Load all JSON and YAML files from config directory
+        self._config = {}
+        config_files = sorted(
+            list(self.config_dir.glob('*.json')) + 
+            list(self.config_dir.glob('*.yaml')) + 
+            list(self.config_dir.glob('*.yml'))
+        )
+        
+        # Merge all config files
+        for config_file in config_files:
+            file_config = self._load_file(config_file)
+            if file_config:
+                self._merge_config(self._config, file_config)
+        
+        # Replace environment variable placeholders
+        self._config = self._resolve_env_vars(self._config)
+    
+    def _load_file(self, file_path: Path) -> Dict[str, Any]:
+        """Load a single JSON or YAML configuration file."""
+        try:
+            with open(file_path, 'r') as f:
+                if file_path.suffix == '.json':
+                    return json.load(f)
+                elif file_path.suffix in {'.yaml', '.yml'}:
+                    return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"Warning: Failed to load {file_path}: {e}")
+            return {}
+    
+    def _merge_config(self, base: Dict, update: Dict) -> None:
+        """Recursively merge update dict into base dict.
+        
+        Args:
+            base: Base configuration dictionary (modified in place)
+            update: Configuration to merge into base
+        """
+        for key, value in update.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._merge_config(base[key], value)
+            else:
+                base[key] = value
+    
+    def _resolve_env_vars(self, config: Any) -> Any:
+        """Recursively resolve environment variable placeholders in config.
+        
+        Replaces ${VAR_NAME} with the value from environment variable.
+        Supports default values: ${VAR_NAME:default_value}
+        """
+        if isinstance(config, dict):
+            return {k: self._resolve_env_vars(v) for k, v in config.items()}
+        elif isinstance(config, list):
+            return [self._resolve_env_vars(item) for item in config]
+        elif isinstance(config, str):
+            # Match ${VAR_NAME} or ${VAR_NAME:default} pattern
+            pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
+            
+            def replacer(match):
+                var_name = match.group(1)
+                default_value = match.group(2) if match.group(2) is not None else ""
+                return os.getenv(var_name, default_value)
+            
+            return re.sub(pattern, replacer, config)
+        else:
+            return config
+    
+    def _create_directories(self):
+        """Create all required directories from config.
+        
+        Looks for 'paths' section in config and creates all directories.
+        """
+        paths_config = self.get('paths', {})
+        
+        def create_dirs_recursive(obj):
+            """Recursively find and create all path directories."""
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(value, str) and ('dir' in key.lower() or 'path' in key.lower()):
+                        Path(value).mkdir(parents=True, exist_ok=True)
+                    else:
+                        create_dirs_recursive(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, str):
+                        Path(item).mkdir(parents=True, exist_ok=True)
+        
+        create_dirs_recursive(paths_config)
+    
+    def get(self, key_path: str, default: Any = None) -> Any:
+        """Get configuration value using dot notation.
+        
+        Args:
+            key_path: Dot-separated path to config value (e.g., 'database.host')
+            default: Default value if key not found
+            
+        Returns:
+            Configuration value or default
+            
+        Examples:
+            >>> config.get('application.name')
+            'My Application'
+            >>> config.get('database.port', 5432)
+            5432
+        """
+        keys = key_path.split('.')
+        value = self._config
+        
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key)
+                if value is None:
+                    return default
+            else:
+                return default
+        
+        return value
+    
+    def get_path(self, key_path: str, default: Optional[str] = None) -> Path:
+        """Get a path configuration as Path object.
+        
+        Args:
+            key_path: Dot-separated path to config value
+            default: Default path string if key not found
+            
+        Returns:
+            Absolute Path object
+        """
+        path_str = self.get(key_path, default)
+        if path_str is None:
+            return Path()
+        return Path(path_str).absolute()
+    
+    def get_all(self) -> Dict[str, Any]:
+        """Get entire configuration dictionary."""
+        return self._config.copy()
+    
+    def set(self, key_path: str, value: Any) -> None:
+        """Set a configuration value using dot notation.
+        
+        Args:
+            key_path: Dot-separated path to config value
+            value: Value to set
+        """
+        keys = key_path.split('.')
+        config = self._config
+        
+        for key in keys[:-1]:
+            if key not in config:
+                config[key] = {}
+            config = config[key]
+        
+        config[keys[-1]] = value
+    
+    def reload(self):
+        """Reload configuration from all files in config directory."""
+        self._config = None
+        self._load_config()
+        if self.auto_create_dirs:
+            self._create_directories()
+    
+    def list_config_files(self) -> List[str]:
+        """List all configuration files loaded.
+        
+        Returns:
+            List of configuration file names
+        """
+        if self.config_dir.exists():
+            files = (
+                list(self.config_dir.glob('*.json')) +
+                list(self.config_dir.glob('*.yaml')) +
+                list(self.config_dir.glob('*.yml'))
+            )
+            return [f.name for f in sorted(files)]
+        return []
+    
+    def has(self, key_path: str) -> bool:
+        """Check if a configuration key exists.
+        
+        Args:
+            key_path: Dot-separated path to config value
+            
+        Returns:
+            True if key exists, False otherwise
+        """
+        keys = key_path.split('.')
+        value = self._config
+        
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return False
+        
+        return True
+    
+    def __getitem__(self, key: str) -> Any:
+        """Dictionary-style access to config values."""
+        return self.get(key)
+    
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Dictionary-style setting of config values."""
+        self.set(key, value)
+    
+    def __contains__(self, key: str) -> bool:
+        """Check if key exists using 'in' operator."""
+        return self.has(key)
 
 
 def load_config_file(config_dir: str | Path, filename: str = "settings") -> Dict[str, Any]:
@@ -32,6 +296,53 @@ def load_config_file(config_dir: str | Path, filename: str = "settings") -> Dict
             if path.suffix == ".json":
                 return json.loads(path.read_text())
     return {}
+
+
+def load_all_config_files(config_dir: str | Path) -> Dict[str, Any]:
+    """Load and merge all JSON and YAML files from a directory.
+    
+    Args:
+        config_dir: Directory containing configuration files
+        
+    Returns:
+        Merged configuration dictionary with env var resolution
+    """
+    cfg_dir = Path(config_dir)
+    if not cfg_dir.exists():
+        return {}
+    
+    config = {}
+    config_files = sorted(
+        list(cfg_dir.glob('*.json')) + 
+        list(cfg_dir.glob('*.yaml')) + 
+        list(cfg_dir.glob('*.yml'))
+    )
+    
+    for config_file in config_files:
+        try:
+            with open(config_file, 'r') as f:
+                if config_file.suffix == '.json':
+                    file_config = json.load(f)
+                elif config_file.suffix in {'.yaml', '.yml'}:
+                    file_config = yaml.safe_load(f) or {}
+                else:
+                    continue
+                
+                # Merge into main config
+                _merge_dicts(config, file_config)
+        except Exception as e:
+            print(f"Warning: Failed to load {config_file}: {e}")
+    
+    return config
+
+
+def _merge_dicts(base: Dict, update: Dict) -> None:
+    """Recursively merge update dict into base dict."""
+    for key, value in update.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            _merge_dicts(base[key], value)
+        else:
+            base[key] = value
 
 
 def load_settings(
@@ -77,3 +388,16 @@ def load_settings(
             setattr(instance, key, value)
 
     return instance
+
+
+# Global configuration instance (singleton)
+config = Config()
+
+
+__all__ = [
+    'Config',
+    'config',
+    'load_config_file',
+    'load_all_config_files',
+    'load_settings',
+]

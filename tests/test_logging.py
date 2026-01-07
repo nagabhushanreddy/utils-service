@@ -1,6 +1,6 @@
 import json
 
-from utils_api.logging import setup_logging
+from utils.logger import setup_logging
 
 
 def test_setup_logging_outputs_json(capsys):
@@ -15,3 +15,4 @@ def test_setup_logging_outputs_json(capsys):
     assert parsed["service"] == "test-service"
     assert parsed["correlation_id"] == "abc"
     assert parsed["level"] == "INFO"
+    print(parsed)

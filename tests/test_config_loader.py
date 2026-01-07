@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings
 
-from utils_api.config import load_config_file, load_settings
+from utils.config import load_config_file, load_settings
 
 
 class _TestSettings(BaseSettings):
