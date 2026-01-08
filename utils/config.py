@@ -11,11 +11,20 @@ This module provides flexible configuration management with support for:
 
 from __future__ import annotations
 
+import configparser
 import json
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
+
+try:  # Python 3.11+
+    import tomllib  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - fallback for older interpreters
+    try:
+        import tomli as tomllib  # type: ignore
+    except Exception:
+        tomllib = None
 
 from pydantic_settings import BaseSettings
 import yaml
@@ -72,9 +81,12 @@ class Config:
         # Load all JSON and YAML files from config directory
         self._config = {}
         config_files = sorted(
-            list(self.config_dir.glob('*.json')) + 
-            list(self.config_dir.glob('*.yaml')) + 
-            list(self.config_dir.glob('*.yml'))
+            list(self.config_dir.glob('*.json')) +
+            list(self.config_dir.glob('*.yaml')) +
+            list(self.config_dir.glob('*.yml')) +
+            list(self.config_dir.glob('*.toml')) +
+            list(self.config_dir.glob('*.ini')) +
+            list(self.config_dir.glob('*.conf'))
         )
         
         # Merge all config files
@@ -87,13 +99,21 @@ class Config:
         self._config = self._resolve_env_vars(self._config)
     
     def _load_file(self, file_path: Path) -> Dict[str, Any]:
-        """Load a single JSON or YAML configuration file."""
+        """Load a single configuration file (json, yaml, toml, ini/conf)."""
         try:
-            with open(file_path, 'r') as f:
-                if file_path.suffix == '.json':
-                    return json.load(f)
-                elif file_path.suffix in {'.yaml', '.yml'}:
-                    return yaml.safe_load(f) or {}
+            if file_path.suffix == '.json':
+                return json.loads(file_path.read_text())
+            if file_path.suffix in {'.yaml', '.yml'}:
+                return yaml.safe_load(file_path.read_text()) or {}
+            if file_path.suffix == '.toml':
+                if tomllib is None:
+                    print("Warning: tomllib not available; skipping toml load")
+                    return {}
+                return tomllib.loads(file_path.read_text())
+            if file_path.suffix in {'.ini', '.conf'}:
+                parser = configparser.ConfigParser()
+                parser.read(file_path)
+                return {section: dict(parser.items(section)) for section in parser.sections()}
         except Exception as e:
             print(f"Warning: Failed to load {file_path}: {e}")
             return {}
@@ -111,16 +131,17 @@ class Config:
             else:
                 base[key] = value
     
-    def _resolve_env_vars(self, config: Any) -> Any:
+    @staticmethod
+    def _resolve_env_vars(config: Any) -> Any:
         """Recursively resolve environment variable placeholders in config.
         
         Replaces ${VAR_NAME} with the value from environment variable.
         Supports default values: ${VAR_NAME:default_value}
         """
         if isinstance(config, dict):
-            return {k: self._resolve_env_vars(v) for k, v in config.items()}
+            return {k: Config._resolve_env_vars(v) for k, v in config.items()}
         elif isinstance(config, list):
-            return [self._resolve_env_vars(item) for item in config]
+            return [Config._resolve_env_vars(item) for item in config]
         elif isinstance(config, str):
             # Match ${VAR_NAME} or ${VAR_NAME:default} pattern
             pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
@@ -229,16 +250,15 @@ class Config:
             self._create_directories()
     
     def list_config_files(self) -> List[str]:
-        """List all configuration files loaded.
-        
-        Returns:
-            List of configuration file names
-        """
+        """List all configuration files loaded."""
         if self.config_dir.exists():
             files = (
                 list(self.config_dir.glob('*.json')) +
                 list(self.config_dir.glob('*.yaml')) +
-                list(self.config_dir.glob('*.yml'))
+                list(self.config_dir.glob('*.yml')) +
+                list(self.config_dir.glob('*.toml')) +
+                list(self.config_dir.glob('*.ini')) +
+                list(self.config_dir.glob('*.conf'))
             )
             return [f.name for f in sorted(files)]
         return []
@@ -277,16 +297,18 @@ class Config:
 
 
 def load_config_file(config_dir: str | Path, filename: str = "settings") -> Dict[str, Any]:
-    """Load a YAML or JSON config file from a directory if present.
+    """Load a single config file (yaml/yml/json/toml/ini/conf) if present.
 
-    Searches for `<filename>.yaml`, `<filename>.yml`, then `<filename>.json`.
-    Returns an empty dict if no file is found.
+    Search order: yaml, yml, json, toml, ini, conf. Returns empty dict if none.
     """
     cfg_dir = Path(config_dir)
     candidates = [
         cfg_dir / f"{filename}.yaml",
         cfg_dir / f"{filename}.yml",
         cfg_dir / f"{filename}.json",
+        cfg_dir / f"{filename}.toml",
+        cfg_dir / f"{filename}.ini",
+        cfg_dir / f"{filename}.conf",
     ]
 
     for path in candidates:
@@ -295,6 +317,12 @@ def load_config_file(config_dir: str | Path, filename: str = "settings") -> Dict
                 return yaml.safe_load(path.read_text()) or {}
             if path.suffix == ".json":
                 return json.loads(path.read_text())
+            if path.suffix == ".toml" and tomllib:
+                return tomllib.loads(path.read_text())
+            if path.suffix in {".ini", ".conf"}:
+                parser = configparser.ConfigParser()
+                parser.read(path)
+                return {section: dict(parser.items(section)) for section in parser.sections()}
     return {}
 
 
@@ -313,9 +341,12 @@ def load_all_config_files(config_dir: str | Path) -> Dict[str, Any]:
     
     config = {}
     config_files = sorted(
-        list(cfg_dir.glob('*.json')) + 
-        list(cfg_dir.glob('*.yaml')) + 
-        list(cfg_dir.glob('*.yml'))
+        list(cfg_dir.glob('*.json')) +
+        list(cfg_dir.glob('*.yaml')) +
+        list(cfg_dir.glob('*.yml')) +
+        list(cfg_dir.glob('*.toml')) +
+        list(cfg_dir.glob('*.ini')) +
+        list(cfg_dir.glob('*.conf'))
     )
     
     for config_file in config_files:
@@ -325,6 +356,12 @@ def load_all_config_files(config_dir: str | Path) -> Dict[str, Any]:
                     file_config = json.load(f)
                 elif config_file.suffix in {'.yaml', '.yml'}:
                     file_config = yaml.safe_load(f) or {}
+                elif config_file.suffix == '.toml' and tomllib:
+                    file_config = tomllib.load(f)
+                elif config_file.suffix in {'.ini', '.conf'}:
+                    parser = configparser.ConfigParser()
+                    parser.read_file(f)
+                    file_config = {section: dict(parser.items(section)) for section in parser.sections()}
                 else:
                     continue
                 
@@ -333,7 +370,7 @@ def load_all_config_files(config_dir: str | Path) -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load {config_file}: {e}")
     
-    return config
+    return Config._resolve_env_vars(config)
 
 
 def _merge_dicts(base: Dict, update: Dict) -> None:

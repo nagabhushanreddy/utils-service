@@ -1,13 +1,9 @@
-"""
-Comprehensive logging configuration and utilities.
+"""Tiny logging helper with config module integration.
 
-This module provides structured logging with:
-- JSON and plain text formatters
-- File and console handlers
-- Configuration-driven setup
-- Structured logging with extra fields
-- Thread-safe operations
-- Log rotation support
+Behavior:
+- If a logging config dict is provided (or available via utils.config), apply it.
+- If that dict is a logging ``dictConfig`` (has ``version``), use it directly.
+- Otherwise, fall back to a simple JSON console + optional rotating file handler.
 """
 
 from __future__ import annotations
@@ -16,69 +12,28 @@ import json
 import logging
 import logging.config
 import logging.handlers
+import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-try:
-    from .config import config
-except ImportError:
-    config = None
+
+DEFAULT_SERVICE_NAME = "utils-service"
+_configured = False
+_active_service_name = DEFAULT_SERVICE_NAME
 
 
-# Reserved LogRecord attributes
-_RESERVED = {
-    "name",
-    "msg",
-    "args",
-    "levelname",
-    "levelno",
-    "pathname",
-    "filename",
-    "module",
-    "exc_info",
-    "exc_text",
-    "stack_info",
-    "lineno",
-    "funcName",
-    "created",
-    "msecs",
-    "relativeCreated",
-    "thread",
-    "threadName",
-    "processName",
-    "process",
-}
+class StructuredFormatter(logging.Formatter):
+    """Very small JSON formatter built on stdlib only."""
 
-
-class JsonFormatter(logging.Formatter):
-    """JSON log formatter with structured fields and extra attributes.
-    
-    Outputs logs in JSON format with timestamp, level, logger name,
-    service name, and any extra fields passed via `extra=` parameter.
-    """
-
-    def __init__(
-        self,
-        service_name: str = "utils-service",
-        extra_fields: Optional[Mapping[str, Any]] = None,
-        include_exception: bool = True,
-    ):
-        """Initialize JSON formatter.
-        
-        Args:
-            service_name: Name of the service for identification
-            extra_fields: Default fields to include in every log
-            include_exception: Whether to include exception info
-        """
+    def __init__(self, service_name: str, extra_fields: Optional[Mapping[str, Any]] = None):
         super().__init__()
         self.service_name = service_name
         self.extra_fields = dict(extra_fields or {})
-        self.include_exception = include_exception
 
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-        """Format log record as JSON string."""
         payload: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
@@ -95,107 +50,51 @@ class JsonFormatter(logging.Formatter):
 
         # Capture any custom attributes attached via `extra=`
         for key, value in record.__dict__.items():
-            if key in _RESERVED or key.startswith("_"):
+            if key.startswith("_"):
+                continue
+            if key in {"name", "msg", "args", "levelname", "levelno", "pathname", "filename", "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName", "created", "msecs", "relativeCreated", "thread", "threadName", "processName", "process"}:
                 continue
             payload.setdefault(key, value)
 
-        # Include exception information if present
-        if self.include_exception and record.exc_info:
+        if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-            payload["exc_type"] = record.exc_info[0].__name__ if record.exc_info[0] else None
 
         return json.dumps(payload, ensure_ascii=True)
 
 
-class DetailedFormatter(logging.Formatter):
-    """Detailed plain text formatter with color support (optional)."""
+def _resolve_env_vars(value: str) -> str:
+    """Resolve ${VAR:default} or ${VAR} in config values."""
+    pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
     
-    DEFAULT_FORMAT = "%(asctime)s [%(levelname)-8s] %(name)s - %(message)s (%(filename)s:%(lineno)d)"
-    SIMPLE_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    def replacer(match):
+        var_name = match.group(1)
+        default_value = match.group(2) if match.group(2) is not None else ""
+        return os.getenv(var_name, default_value)
     
-    def __init__(self, fmt: Optional[str] = None, datefmt: Optional[str] = None, detailed: bool = True):
-        """Initialize formatter.
-        
-        Args:
-            fmt: Custom format string
-            datefmt: Date format string
-            detailed: Use detailed format with file/line info
-        """
-        if fmt is None:
-            fmt = self.DEFAULT_FORMAT if detailed else self.SIMPLE_FORMAT
-        super().__init__(fmt=fmt, datefmt=datefmt)
+    return re.sub(pattern, replacer, value)
 
 
-def setup_logging(
-    service_name: str = "utils-service",
-    level: str | int = "INFO",
-    json_logs: bool = False,
-    log_file: Optional[str | Path] = None,
-    max_bytes: int = 10 * 1024 * 1024,  # 10MB
+def _configure_default(
+    service_name: str,
+    level: str | int = logging.INFO,
+    log_file: Optional[str] = None,
+    max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
     extra_fields: Optional[Mapping[str, Any]] = None,
-    propagate: bool = False,
-    use_config: bool = True,
-) -> logging.Logger:
-    """Configure and return a comprehensive logger.
+) -> None:
+    """Set up console + optional file handler with JSON formatting."""
+    formatter = StructuredFormatter(service_name=service_name, extra_fields=extra_fields)
     
-    Args:
-        service_name: Name of the service/logger
-        level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        json_logs: Use JSON formatter instead of plain text
-        log_file: Path to log file (enables file logging with rotation)
-        max_bytes: Max size of log file before rotation
-        backup_count: Number of backup files to keep
-        extra_fields: Default fields to include in every log
-        propagate: Whether to propagate to parent loggers
-        use_config: Try to load configuration from config utility
-        
-    Returns:
-        Configured logger instance
-    """
-    # Try to read from config if available
-    if use_config and config is not None:
-        try:
-            # Override with config values if not explicitly set
-            if isinstance(level, str):
-                level = config.get('logging.level', level)
-            if log_file is None:
-                log_file_path = config.get('logging.file') or config.get('paths.logs.file')
-                if log_file_path:
-                    log_file = Path(log_file_path)
-            
-            # Get other config settings
-            json_logs = config.get('logging.json_format', json_logs)
-            max_bytes = config.get('logging.max_bytes', max_bytes)
-            backup_count = config.get('logging.backup_count', backup_count)
-            
-            # Get service name from config
-            service_name = config.get('application.name', service_name)
-        except Exception as e:
-            # Silently continue if config reading fails
-            pass
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level if isinstance(level, int) else getattr(logging, str(level).upper(), logging.INFO))
 
-    # Get or create logger
-    logger = logging.getLogger(service_name)
-    logger.handlers.clear()
-    logger.setLevel(level if isinstance(level, int) else getattr(logging, level.upper(), logging.INFO))
-    logger.propagate = propagate
-
-    # Create formatter
-    if json_logs:
-        formatter: logging.Formatter = JsonFormatter(
-            service_name=service_name,
-            extra_fields=extra_fields,
-        )
-    else:
-        formatter = DetailedFormatter(detailed=True)
-
-    # Console handler (stdout)
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    root.addHandler(console_handler)
 
-    # File handler with rotation (if log_file specified)
+    # File handler (if configured)
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,225 +105,131 @@ def setup_logging(
             backupCount=backup_count,
             encoding='utf-8',
         )
-        
-        # Use JSON for file logs if requested, otherwise use detailed format
-        if json_logs:
-            file_handler.setFormatter(JsonFormatter(service_name=service_name, extra_fields=extra_fields))
-        else:
-            file_handler.setFormatter(DetailedFormatter(detailed=True))
-        
-        logger.addHandler(file_handler)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
-    return logger
+    # Also name a service-specific logger for convenience
+    logging.getLogger(service_name).setLevel(logging.NOTSET)
 
 
-def setup_global_logger(
+def _get_logging_config_from_utils(config_dir: str | Path) -> Dict[str, Any]:
+    """Attempt to fetch logging config via utils.config, falling back to file scan."""
+    try:
+        from .config import config as global_config
+        cfg = global_config.get("logging", {})
+        if cfg:
+            return cfg
+        # Fallback: merge all config files from directory
+        from .config import load_all_config_files
+        merged = load_all_config_files(config_dir)
+        return merged.get("logging", {}) if isinstance(merged, dict) else {}
+    except Exception:
+        return {}
+
+
+def setup_logging(
     service_name: Optional[str] = None,
-    use_dict_config: bool = True,
-) -> logging.Logger:
-    """Setup global logger using configuration from config utility.
-    
-    Args:
-        service_name: Override service name (defaults to config value)
-        use_dict_config: Try to use logging.config.dictConfig if available
-        
-    Returns:
-        Configured global logger
+    *,
+    logging_config: Optional[Dict[str, Any]] = None,
+    config_dir: str | Path = "config",
+) -> None:
+    """Idempotent logger setup.
+
+    Priority:
+    1) Explicit ``logging_config`` dict provided by caller
+    2) Logging config from utils.config (merged files)
+    3) Fallback to basic JSON console/file handler
     """
-    if config is None:
-        return setup_logging(service_name=service_name or "utils-service")
-    
-    # Get service name from config
-    if service_name is None:
-        service_name = config.get('application.name', 'utils-service')
-    
-    # Try to use dictConfig if logging config exists in config
-    if use_dict_config:
-        logging_config = config.get('logging')
-        if isinstance(logging_config, dict) and 'version' in logging_config:
-            try:
-                logging.config.dictConfig(logging_config)
-                return logging.getLogger(service_name)
-            except Exception as e:
-                # Fall through to manual setup
-                pass
-    
-    # Manual setup using config values
-    log_level = config.get('logging.level', 'INFO')
-    json_logs = config.get('logging.json_format', False)
-    log_file_path = config.get('logging.file') or config.get('paths.logs.file')
-    max_bytes = config.get('logging.max_bytes', 10 * 1024 * 1024)
-    backup_count = config.get('logging.backup_count', 5)
-    
-    return setup_logging(
-        service_name=service_name,
-        level=log_level,
-        json_logs=json_logs,
-        log_file=log_file_path,
-        max_bytes=max_bytes,
-        backup_count=backup_count,
-        use_config=False,  # Already read config
+    global _configured, _active_service_name
+    if _configured:
+        if logging_config is None:
+            return
+        reset_logging()
+
+    section = logging_config or _get_logging_config_from_utils(config_dir) or {}
+    section = section.get("logging", section) if isinstance(section, dict) else {}
+
+    # Resolve parameters
+    resolved_service = service_name or section.get("service_name")
+    if resolved_service is None:
+        try:
+            from .config import config as global_config  # type: ignore
+
+            resolved_service = global_config.get("application.name")
+        except Exception:
+            resolved_service = None
+    resolved_service = resolved_service or DEFAULT_SERVICE_NAME
+    resolved_level = section.get("level", logging.INFO)
+    log_file = section.get("file")
+    if isinstance(log_file, str):
+        log_file = _resolve_env_vars(log_file)
+    if not log_file:
+        try:
+            from .config import config as global_config  # type: ignore
+
+            fallback_file = global_config.get("paths.logs.file")
+            if fallback_file:
+                log_file = fallback_file
+        except Exception:
+            pass
+    max_bytes = section.get("max_bytes", 10 * 1024 * 1024)
+    backup_count = section.get("backup_count", 5)
+    extra_fields = section.get("extra_fields", {}) if isinstance(section, dict) else {}
+
+    # If dictConfig provided, use it directly
+    if isinstance(section, dict) and section.get("version"):
+        try:
+            logging.config.dictConfig(section)
+            svc_logger = logging.getLogger(resolved_service)
+            svc_logger.setLevel(logging.NOTSET)
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers:
+                if handler not in svc_logger.handlers:
+                    svc_logger.addHandler(handler)
+            svc_logger.propagate = True
+            _active_service_name = resolved_service
+            _configured = True
+            return
+        except Exception:
+            # Fall back to manual configuration
+            pass
+
+    _configure_default(
+        resolved_service,
+        resolved_level,
+        log_file,
+        max_bytes,
+        backup_count,
+        extra_fields,
     )
 
-
-def get_logger(name: Optional[str] = None, module_name: Optional[str] = None) -> logging.Logger:
-    """Get a logger instance.
-    
-    Args:
-        name: Logger name. If None, returns root logger.
-        module_name: Module name to append to base logger name.
-        
-    Returns:
-        Logger instance
-        
-    Examples:
-        >>> logger = get_logger('myapp')
-        >>> logger = get_logger('myapp', 'database')  # Returns 'myapp.database'
-    """
-    if name is None:
-        return logging.getLogger()
-    
-    if module_name:
-        return logging.getLogger(f"{name}.{module_name}")
-    
-    return logging.getLogger(name)
+    _configured = True
+    _active_service_name = resolved_service
 
 
-class Logger:
-    """Singleton logger instance.
-    
-    Provides a global logger accessible throughout the application with
-    config-driven setup and structured logging capabilities.
-    """
-    
-    _instance = None
-    _logger = None
-    
-    def __new__(cls, *args, **kwargs):
-        """Singleton pattern to ensure single logger instance."""
-        if cls._instance is None:
-            cls._instance = super(Logger, cls).__new__(cls)
-        return cls._instance
-    
-    def __init__(self, service_name: Optional[str] = None, use_config: bool = True):
-        """Initialize singleton logger.
-        
-        Args:
-            service_name: Override service name (defaults to config value)
-            use_config: Try to load configuration from config utility
-        """
-        if self._logger is None:
-            self._logger = setup_global_logger(service_name=service_name, use_dict_config=use_config)
-    
-    def info(self, msg: str, *args, **kwargs):
-        """Log an info message."""
-        return self._logger.info(msg, *args, **kwargs)
-    
-    def debug(self, msg: str, *args, **kwargs):
-        """Log a debug message."""
-        return self._logger.debug(msg, *args, **kwargs)
-    
-    def warning(self, msg: str, *args, **kwargs):
-        """Log a warning message."""
-        return self._logger.warning(msg, *args, **kwargs)
-    
-    def error(self, msg: str, *args, **kwargs):
-        """Log an error message."""
-        return self._logger.error(msg, *args, **kwargs)
-    
-    def critical(self, msg: str, *args, **kwargs):
-        """Log a critical message."""
-        return self._logger.critical(msg, *args, **kwargs)
-    
-    def exception(self, msg: str, *args, **kwargs):
-        """Log an exception."""
-        return self._logger.exception(msg, *args, **kwargs)
-    
-    def get_underlying_logger(self) -> logging.Logger:
-        """Get the underlying Python logger instance."""
-        return self._logger
-    
-    @classmethod
-    def reset(cls):
-        """Reset singleton (for testing purposes)."""
-        cls._instance = None
-        cls._logger = None
-
-
-# Lazy initialization of global logger singleton
-_logger_instance = None
-
-
-def _get_or_create_logger():
-    """Lazy initialization of logger singleton.
-    
-    Returns the existing logger or creates one on first access.
-    This ensures config is loaded before logger is initialized.
-    """
-    global _logger_instance
-    if _logger_instance is None:
-        try:
-            _logger_instance = Logger()
-        except Exception as e:
-            # Fallback to basic logger if setup fails
-            fallback_logger = logging.getLogger("utils-service")
-            logging.basicConfig(level=logging.INFO)
-            fallback_logger.warning(f"Failed to setup global logger: {e}")
-            
-            # Create a minimal Logger singleton with fallback
-            class FallbackLogger:
-                def __init__(self):
-                    self._logger = fallback_logger
-                
-                def info(self, msg, *args, **kwargs):
-                    return self._logger.info(msg, *args, **kwargs)
-                
-                def debug(self, msg, *args, **kwargs):
-                    return self._logger.debug(msg, *args, **kwargs)
-                
-                def warning(self, msg, *args, **kwargs):
-                    return self._logger.warning(msg, *args, **kwargs)
-                
-                def error(self, msg, *args, **kwargs):
-                    return self._logger.error(msg, *args, **kwargs)
-                
-                def critical(self, msg, *args, **kwargs):
-                    return self._logger.critical(msg, *args, **kwargs)
-                
-                def exception(self, msg, *args, **kwargs):
-                    return self._logger.exception(msg, *args, **kwargs)
-                
-                def get_underlying_logger(self):
-                    return self._logger
-            
-            _logger_instance = FallbackLogger()
-    
-    return _logger_instance
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """Return a logger, ensuring configuration is applied once."""
+    setup_logging()
+    return logging.getLogger(name or _active_service_name)
 
 
 class _LoggerProxy:
-    """Proxy that lazily initializes logger on first use.
-    
-    This ensures config is loaded before logger initialization when using:
-        from utils import logger
-        logger.info("message")
-    """
-    
-    def __getattr__(self, name):
-        """Delegate all attribute access to the real logger."""
-        return getattr(_get_or_create_logger(), name)
+    def __getattr__(self, item):
+        logger = get_logger()
+        return getattr(logger, item)
 
 
-# Create a proxy instance that will lazily initialize the real logger
+# Lazy proxy so imports don't freeze configuration before setup
 logger = _LoggerProxy()
 
 
-__all__ = [
-    'Logger',
-    'logger',
-    'get_logger',
-    'setup_logging',
-    'setup_global_logger',
-    'JsonFormatter',
-    'DetailedFormatter',
-]
+def reset_logging() -> None:
+    """Reset logging setup (useful for tests)."""
+    global _configured, _active_service_name
+    _configured = False
+    _active_service_name = DEFAULT_SERVICE_NAME
+    root = logging.getLogger()
+    root.handlers.clear()
+
+
+__all__ = ["setup_logging", "get_logger", "logger", "StructuredFormatter", "reset_logging"]

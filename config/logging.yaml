@@ -1,0 +1,36 @@
+# Logging Configuration for Auth Service
+# This file is loaded by utils.config.Config and used by utils.logger
+
+logging:
+  # Service name for structured logging
+  # service_name: auth-service
+  
+  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: ${LOG_LEVEL:INFO}
+  
+  # JSON formatted logs (used for file handler)
+  json_format: ${LOG_FILE_JSON:false}
+  
+  # Console logging
+  console:
+    enabled: true
+    colored: true
+  
+  # File logging with rotation
+  file: ${LOG_FILE_PATH:logs/auth-service.log}
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+  
+  # Additional fields to include in all log messages
+  extra_fields:
+    service: auth-service
+    environment: ${ENVIRONMENT:development}
+  
+  # Logger specific levels (optional overrides)
+  loggers:
+    uvicorn.access:
+      level: WARNING
+    uvicorn.error:
+      level: ERROR
+    httpx:
+      level: WARNING

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from utils.config import config
-from utils.logger import Logger
+from utils.logger import get_logger, reset_logging, setup_logging
 
 
 @pytest.fixture
@@ -69,17 +69,16 @@ paths:
     config.config_dir = cfg_dir
     config.reload()
     
-    # Reset logger singleton to reinitialize with new config
-    Logger.reset()
+    reset_logging()
     
     # Yield control to test function
     yield cfg_dir, logs_dir
     
     # AFTER TEST: Cleanup (runs after test completes, even if test fails)
-    Logger.reset()
+    reset_logging()
     config.config_dir = original_config_dir
     config.reload()
-    Logger()  # Reinitialize with original config
+    setup_logging()
 
 
 def test_config_and_logger_integration(temp_config_and_logs):
@@ -107,8 +106,9 @@ def test_config_and_logger_integration(temp_config_and_logs):
     assert config.get("logging.level") == "INFO"
     assert config.get("logging.json_format") is True
     
-    # Get singleton logger (reinitialized with new config by fixture)
-    logger = Logger()
+    # Initialize logger using the loaded config
+    setup_logging()
+    logger = get_logger()
     
     # Write structured log messages
     logger.info("Integration test started", extra={"test_id": "test_001"})
