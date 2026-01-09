@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "utils-service"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared utilities for API services (logging, configuration, helpers)"
 authors = [{ name = "Team" }]
 requires-python = ">=3.9"
 dependencies = [
   "pydantic-settings>=2.1.0",
   "pyyaml>=6.0",
+  "python-json-logger>=2.0.0",
+  "tomli>=2.0.1",
 ]
 
 [project.optional-dependencies]
