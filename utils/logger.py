@@ -1,237 +1,179 @@
-"""Simplified logger using python-json-logger.
-
-This module provides logging utilities for applications.
-The host application is responsible for configuring logging via init_app_logging().
-
-Usage:
-    # In your application startup
-    from utils.logger import init_app_logging
-    init_app_logging(service_name='my-service')
-    
-    # In your modules
-    from utils import logger
-    logger.info('message')
-    
-    # Or get named loggers
-    from utils.logger import get_logger
-    db_logger = get_logger('database')
 """
+Minimal logger setup with dictConfig support.
 
+This module provides a centralized logger that services can import.
+It prefers a standard logging.config.dictConfig YAML/JSON under the
+`logging` key in config; otherwise it falls back to a sensible default.
+"""
 import logging
 import logging.config
-import logging.handlers
 from pathlib import Path
-
-from pythonjsonlogger import jsonlogger
+from typing import Any, Dict
 
 from .config import config
 
 
+def _service_name() -> str:
+    return (
+        config.get("application.name")
+        or config.get("service.name")
+        or "utils-service"
+    )
+
+
+def _ensure_log_dirs(logging_cfg: Dict[str, Any]) -> None:
+    """Create parent directories for any file handlers defined in config."""
+    handlers = logging_cfg.get("handlers", {}) if isinstance(logging_cfg, dict) else {}
+    for handler in handlers.values():
+        if isinstance(handler, dict):
+            filename = handler.get("filename")
+            if filename:
+                try:
+                    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    # Don't fail logger setup if directory creation fails
+                    pass
+
+
+def _default_logging_dict() -> Dict[str, Any]:
+    """Return a simple, working dictConfig with console + file handlers.
+
+    Default output is structured JSON using python-json-logger.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            # JSON formatter is the default
+            "json": {
+                "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+                "format": "%(asctime)s %(name)s %(levelname)s %(message)s %(module)s %(lineno)d",
+            },
+            # Keep a simple text formatter available if needed
+            "standard": {
+                "format": "%(asctime)s - %(name)s - %(levelname)s - [%(module)s:%(lineno)d] - %(message)s",
+            },
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "level": "INFO",
+                "formatter": "standard",
+                "stream": "ext://sys.stdout",
+            },
+            "file": {
+                "class": "logging.FileHandler",
+                "level": "INFO",
+                "formatter": "json",
+                "filename": "logs/service.log",
+                "encoding": "utf-8",
+            },
+        },
+        "root": {"level": "INFO", "handlers": ["console", "file"]},
+    }
+
+
+# Singleton logger instance (created after init_app_logging is called)
+_logger_instance: logging.Logger | None = None
 _initialized = False
-_service_name = None
 
 
-class CustomJsonFormatter(jsonlogger.JsonFormatter):
-    """JSON formatter that maps levelname to 'level' and asctime to 'timestamp'."""
-    def add_fields(self, log_record, record, message_dict):
-        super().add_fields(log_record, record, message_dict)
-        if 'levelname' in log_record:
-            log_record['level'] = log_record.pop('levelname')
-        if 'asctime' in log_record:
-            log_record['timestamp'] = log_record.pop('asctime')
+def _apply_logging_config(cfg: Dict[str, Any]) -> None:
+    """Apply logging configuration with safe fallback."""
+    if not isinstance(cfg, dict):
+        cfg = _default_logging_dict()
+
+    _ensure_log_dirs(cfg)
+
+    try:
+        if cfg.get("version"):
+            logging.config.dictConfig(cfg)
+        else:
+            logging.config.dictConfig(_default_logging_dict())
+    except Exception as e:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+        logging.getLogger(__name__).warning(
+            f"Failed to load logging config, using basic config: {e}"
+        )
 
 
-def init_app_logging(service_name: str = None, logging_config: dict = None):
-    """Initialize application logging. Call this once at application startup.
+def init_app_logging(service_name: str | None = None, logging_config: Dict[str, Any] | None = None) -> logging.Logger:
+    """Initialize application logging. Call this after config is loaded.
     
     Args:
-        service_name: Name of the service (default: from config.application.name or 'utils-service')
-        logging_config: Optional logging configuration dict. If not provided, will use config.get("logging")
+        service_name: Optional service name (defaults to config value)
+        logging_config: Optional logging config dict (defaults to config.get('logging'))
     
     Returns:
-        Logger instance for the service
-    
-    Example:
-        # Basic usage
-        init_app_logging('my-service')
-        
-        # With custom config
-        init_app_logging('my-service', logging_config={'level': 'DEBUG', 'file': 'app.log'})
-        
-        # Using dictConfig
-        init_app_logging('my-service', logging_config={
-            'version': 1,
-            'handlers': {...},
-            'formatters': {...}
-        })
+        Configured logger instance
     """
-    global _initialized, _service_name
+    global _logger_instance, _initialized
     
-    # Resolve service name
-    if not service_name:
-        service_name = config.get("application.name", "utils-service")
-    _service_name = service_name
+    # Get config from parameter or config system
+    cfg = logging_config if isinstance(logging_config, dict) else config.get("logging")
     
-    # Get logging configuration
-    if logging_config is None:
-        logging_config = config.get("logging", {})
+    # Apply the configuration
+    _apply_logging_config(cfg)
     
-    # Create log file directory if specified
-    log_file = logging_config.get("file") or config.get("paths.logs.file")
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    
-    # Clear existing handlers
-    root = logging.getLogger()
-    for handler in root.handlers[:]:
-        root.removeHandler(handler)
-        handler.close()
-    
-    # If logging_config has 'version' key, it's a dictConfig
-    if logging_config.get("version"):
-        try:
-            logging.config.dictConfig(logging_config)
-            _initialized = True
-            return logging.getLogger(service_name)
-        except Exception as e:
-            logging.warning(f"Failed to load logging dictConfig: {e}")
-    
-    # Fallback: setup JSON formatter with basic config
-    log_format = '%(asctime)s %(levelname)s %(name)s %(message)s %(module)s %(funcName)s %(lineno)d'
-    formatter = CustomJsonFormatter(log_format)
-    
-    # Get log level
-    log_level = logging_config.get("level", "INFO")
-    level = getattr(logging, str(log_level).upper(), logging.INFO)
-    
-    # Setup handlers
-    handlers = []
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    handlers.append(console_handler)
-    
-    # File handler with rotation
-    if log_file:
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=logging_config.get("max_bytes", 10 * 1024 * 1024),
-            backupCount=logging_config.get("backup_count", 5),
-            encoding='utf-8'
-        )
-        file_handler.setFormatter(formatter)
-        handlers.append(file_handler)
-    
-    # Configure root logger
-    root.setLevel(level)
-    for handler in handlers:
-        root.addHandler(handler)
-    
+    # Create and store the logger singleton
+    name = service_name or _service_name()
+    _logger_instance = logging.getLogger(name)
     _initialized = True
-    return logging.getLogger(service_name)
+    
+    return _logger_instance
 
 
-class LazyLoggerProxy:
-    """Lazy proxy that returns loggers only after initialization."""
+def setup_global_logger() -> logging.Logger:
+    """Setup and configure the global logger from configuration.
     
-    def _get_logger(self):
-        """Get the logger, initializing if needed."""
-        if not _initialized:
-            # If not initialized, return a NullHandler logger that warns once
-            logger = logging.getLogger('utils-service-uninitialized')
-            if not logger.handlers:
-                logger.addHandler(logging.NullHandler())
-                import warnings
-                warnings.warn(
-                    "Logging not initialized. Call init_app_logging() in your application startup.",
-                    RuntimeWarning,
-                    stacklevel=3
-                )
-            return logger
-        return logging.getLogger(_service_name)
+    This is called automatically on first logger access if init_app_logging wasn't called.
+    """
+    global _logger_instance, _initialized
     
-    def debug(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().debug(msg, *args, **kwargs)
+    if not _initialized:
+        cfg = config.get("logging")
+        _apply_logging_config(cfg)
+        _logger_instance = logging.getLogger(_service_name())
+        _initialized = True
     
-    def info(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().info(msg, *args, **kwargs)
-    
-    def warning(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().warning(msg, *args, **kwargs)
-    
-    def error(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().error(msg, *args, **kwargs)
-    
-    def critical(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().critical(msg, *args, **kwargs)
-    
-    def exception(self, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 2
-        return self._get_logger().exception(msg, *args, **kwargs)
-    
-    def log(self, level, msg, *args, **kwargs):
-        kwargs.setdefault('stacklevel', 1)
-        kwargs['stacklevel'] += 1
-        return self._get_logger().log(level, msg, *args, **kwargs)
+    return _logger_instance
+
+
+class _LazyLogger:
+    """Lazy logger proxy that initializes on first access."""
     
     def __getattr__(self, name):
-        return getattr(self._get_logger(), name)
+        if _logger_instance is None:
+            setup_global_logger()
+        return getattr(_logger_instance, name)
+    
+    def __call__(self, *args, **kwargs):
+        if _logger_instance is None:
+            setup_global_logger()
+        return _logger_instance(*args, **kwargs)
 
 
-# Lazy logger - dormant until init_app_logging() is called
-logger = LazyLoggerProxy()
+# Lazy logger instance - auto-initializes on first use
+logger = _LazyLogger()
 
 
-def get_logger(name: str = None):
-    """Get a logger instance.
+def get_logger(name: str | None = None) -> logging.Logger:
+    """Get a named logger instance.
     
     Args:
-        name: Logger name. If None, returns the main service logger.
-              If provided, returns a child logger (e.g., 'my-service.database')
-        
+        name: Optional sub-logger name (e.g., 'database' -> 'service.database')
+    
     Returns:
         Logger instance
-    
-    Note:
-        Make sure to call init_app_logging() before using loggers.
     """
     if not _initialized:
-        import warnings
-        warnings.warn(
-            "Logging not initialized. Call init_app_logging() in your application startup.",
-            RuntimeWarning,
-            stacklevel=2
-        )
-        null_logger = logging.getLogger(f'uninitialized.{name or "default"}')
-        null_logger.addHandler(logging.NullHandler())
-        return null_logger
+        setup_global_logger()
     
-    if name:
-        return logging.getLogger(f'{_service_name}.{name}')
-    return logging.getLogger(_service_name)
+    base = _service_name()
+    return logging.getLogger(f"{base}.{name}" if name else base)
 
 
-def reset_logging():
-    """Reset logging setup (useful for tests)."""
-    global _initialized, _service_name
-    _initialized = False
-    _service_name = None
-    root = logging.getLogger()
-    for handler in root.handlers[:]:
-        root.removeHandler(handler)
-        handler.close()
-
-
-__all__ = ['logger', 'get_logger', 'init_app_logging', 'reset_logging']
+__all__ = ["logger", "get_logger", "init_app_logging", "setup_global_logger"]

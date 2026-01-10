@@ -1,7 +1,7 @@
-from utils import logger, init_app_logging
+from utils import logger, init_utils
 
 # Initialize logging at application startup
-init_app_logging('auth-service')
+init_utils('config')
 
 logger.info("Hello from test.py")
 
