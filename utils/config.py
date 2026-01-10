@@ -35,6 +35,70 @@ load_dotenv()
 
 SettingsType = TypeVar("SettingsType", bound=BaseSettings)
 
+_PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
+
+
+_PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
+
+
+def _get_value_from_path(root: Any, path: str) -> Any:
+    """Retrieve a value from a nested mapping/list using dot notation.
+
+    Supports numeric list indices in the path. Returns None when a path segment
+    is missing.
+    """
+    if root is None:
+        return None
+
+    current: Any = root
+    for part in path.split('.'):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list):
+            try:
+                idx = int(part)
+            except ValueError:
+                return None
+            if 0 <= idx < len(current):
+                current = current[idx]
+            else:
+                return None
+        else:
+            return None
+
+    return current
+
+
+def resolve_placeholders(value: Any, root: Any | None = None, env: os._Environ[str] | Dict[str, str] = os.environ) -> Any:
+    """Recursively resolve ${VAR} placeholders within a structure.
+
+    Resolution order: environment variable (env-first) -> value from `root`
+    using dot notation -> placeholder default (if provided) -> empty string.
+    """
+    root_value = value if root is None else root
+
+    if isinstance(value, dict):
+        return {k: resolve_placeholders(v, root_value, env) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_placeholders(item, root_value, env) for item in value]
+    if isinstance(value, str):
+        def replacer(match: re.Match[str]) -> str:
+            key = match.group(1)
+            default = match.group(2) if match.group(2) is not None else ""
+
+            if key in env:
+                return env[key]
+
+            root_match = _get_value_from_path(root_value, key)
+            if root_match is not None:
+                return "" if root_match is None else str(root_match)
+
+            return default if match.group(2) is not None else ""
+
+        return _PLACEHOLDER_PATTERN.sub(replacer, value)
+
+    return value
+
 
 class Config:
     """Flexible configuration loader with singleton pattern and advanced features.
@@ -96,7 +160,7 @@ class Config:
                 self._merge_config(self._config, file_config)
         
         # Replace environment variable placeholders
-        self._config = self._resolve_env_vars(self._config)
+        self._config = resolve_placeholders(self._config, root=self._config, env=os.environ)
     
     def _load_file(self, file_path: Path) -> Dict[str, Any]:
         """Load a single configuration file (json, yaml, toml, ini/conf)."""
@@ -133,27 +197,8 @@ class Config:
     
     @staticmethod
     def _resolve_env_vars(config: Any) -> Any:
-        """Recursively resolve environment variable placeholders in config.
-        
-        Replaces ${VAR_NAME} with the value from environment variable.
-        Supports default values: ${VAR_NAME:default_value}
-        """
-        if isinstance(config, dict):
-            return {k: Config._resolve_env_vars(v) for k, v in config.items()}
-        elif isinstance(config, list):
-            return [Config._resolve_env_vars(item) for item in config]
-        elif isinstance(config, str):
-            # Match ${VAR_NAME} or ${VAR_NAME:default} pattern
-            pattern = r'\$\{([^}:]+)(?::([^}]*))?\}'
-            
-            def replacer(match):
-                var_name = match.group(1)
-                default_value = match.group(2) if match.group(2) is not None else ""
-                return os.getenv(var_name, default_value)
-            
-            return re.sub(pattern, replacer, config)
-        else:
-            return config
+        """Resolve ${VAR} placeholders using env-first lookup with config fallback."""
+        return resolve_placeholders(config, root=config, env=os.environ)
     
     def _create_directories(self):
         """Create all required directories from config.
@@ -437,4 +482,5 @@ __all__ = [
     'load_config_file',
     'load_all_config_files',
     'load_settings',
+    'resolve_placeholders',
 ]

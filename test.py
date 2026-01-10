@@ -15,5 +15,9 @@ def test_logging():
     except ZeroDivisionError:
         logger.exception("An exception occurred")
 
+    import utils.config as config
+    all_config = config.get_all()
+    logger.info(f"All configuration: {all_config}")
+
 if __name__ == "__main__":
     test_logging()
