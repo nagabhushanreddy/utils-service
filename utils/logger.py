@@ -73,8 +73,51 @@ def _default_logging_dict() -> Dict[str, Any]:
     }
 
 
+# Helpers for dictConfig robustness
+def _resolve_placeholders(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve ${VAR:default} placeholders using environment variables."""
+    import os, re
+    pattern = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
+
+    def replace_str(s: str) -> str:
+        def repl(m: re.Match[str]) -> str:
+            key = m.group(1)
+            default = m.group(2) if m.group(2) is not None else ""
+            return os.environ.get(key, default)
+        return pattern.sub(repl, s)
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: walk(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [walk(i) for i in v]
+        if isinstance(v, str):
+            replaced = replace_str(v)
+            # Coerce plain-digit strings to int for handler args like maxBytes/backupCount
+            if replaced.isdigit():
+                try:
+                    return int(replaced)
+                except Exception:
+                    return replaced
+            return replaced
+        return v
+
+    return walk(cfg)
+
+
+def _normalize_formatter_classes(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert formatter 'class' entries to '()' callable format."""
+    fmts = cfg.get("formatters")
+    if isinstance(fmts, dict):
+        for _, fmt in fmts.items():
+            if isinstance(fmt, dict) and "class" in fmt and "()" not in fmt:
+                fmt["()"] = fmt.pop("class")
+    return cfg
+
+
 # Singleton logger instance (created after init_app_logging is called)
 _logger_instance: logging.Logger | None = None
+
 _initialized = False
 
 
@@ -83,6 +126,11 @@ def _apply_logging_config(cfg: Dict[str, Any]) -> None:
     if not isinstance(cfg, dict):
         cfg = _default_logging_dict()
 
+    # Resolve env placeholders and normalize formatter definitions
+    
+    cfg = _resolve_placeholders(cfg)
+    cfg = _normalize_formatter_classes(cfg)
+    
     _ensure_log_dirs(cfg)
 
     try:
